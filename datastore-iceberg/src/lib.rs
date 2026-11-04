@@ -359,13 +359,35 @@ struct TableEntry {
     manifest_list_size: Option<u64>,
 }
 
+/// Where one entry's version of a table stands against another's.
+enum VersionOrder {
+    Earlier,
+    Same,
+    Later,
+    /// A different table under the same name: dropped and created again.
+    DifferentTable,
+}
+
 impl TableEntry {
-    /// Where this entry's version stands among the table's: later commits
-    /// have higher sequence numbers, and a metadata change without a commit
-    /// a later update time.
-    fn version(&self) -> (i64, i64) {
-        let metadata = self.table.metadata();
-        (metadata.last_sequence_number(), metadata.last_updated_ms())
+    /// Where this entry's version stands against `other`'s. The catalog
+    /// numbers a table's snapshots in commit order and the number never
+    /// decreases, so a higher last sequence number is later, and an equal
+    /// one is the same commit or a metadata change on top of it. A different
+    /// uuid is a different table, whose versions are not ordered against
+    /// this one's.
+    fn compare_version(&self, other: &TableEntry) -> VersionOrder {
+        let (mine, theirs) = (self.table.metadata(), other.table.metadata());
+        if mine.uuid() != theirs.uuid() {
+            return VersionOrder::DifferentTable;
+        }
+        match mine
+            .last_sequence_number()
+            .cmp(&theirs.last_sequence_number())
+        {
+            std::cmp::Ordering::Less => VersionOrder::Earlier,
+            std::cmp::Ordering::Equal => VersionOrder::Same,
+            std::cmp::Ordering::Greater => VersionOrder::Later,
+        }
     }
 
     fn manifest_list_path(&self) -> Option<&str> {
@@ -429,8 +451,12 @@ impl IcebergDatastore {
                 else {
                     continue;
                 };
-                if held_entry.version() > fetched_entry.version() {
-                    *fetched_entry = held_entry.clone();
+                match held_entry.compare_version(fetched_entry) {
+                    VersionOrder::Later => *fetched_entry = held_entry.clone(),
+                    VersionOrder::Earlier | VersionOrder::Same => {}
+                    VersionOrder::DifferentTable => {
+                        tracing::info!(%schema, %table, "the table was dropped and created again");
+                    }
                 }
             }
         }
@@ -441,7 +467,9 @@ impl IcebergDatastore {
     /// Publish `table`, at the version a commit of this process just landed,
     /// into the index with the store the commit wrote through, so the next
     /// query sees the version before the background refresh does. An entry
-    /// already later than it (another refresh got there first) stands.
+    /// already at that version or later (a refresh got there first, perhaps
+    /// with a metadata change on top of the commit) stands, as does one of a
+    /// table created again under the name since the commit was built.
     pub(crate) fn publish_table(
         &self,
         name: &SchemaQualifiedTableName,
@@ -455,12 +483,12 @@ impl IcebergDatastore {
             manifest_list_size: Some(manifest_list_size),
         };
         let mut index = self.index.write().unwrap();
-        let held_is_newer = index
-            .table_entry(name)
-            .and_then(|held| held.as_ref().ok())
-            .is_some_and(|held| held.version() > entry.version());
-        if held_is_newer {
-            return;
+        let held = index.table_entry(name).and_then(|held| held.as_ref().ok());
+        match held.map(|held| held.compare_version(&entry)) {
+            None | Some(VersionOrder::Earlier) => {}
+            Some(VersionOrder::Same | VersionOrder::Later | VersionOrder::DifferentTable) => {
+                return;
+            }
         }
         let mut updated = (**index).clone();
         updated
