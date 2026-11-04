@@ -12,7 +12,7 @@
 
 mod commit;
 mod data_files;
-mod manifest_writer;
+mod storage;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,8 +32,9 @@ use planner::catalog::{Column, SchemaQualifiedTableName};
 
 use crate::columns::table_columns;
 use crate::store::TableStore;
-use crate::table::{LoadedTable, identity_columns};
+use crate::table::{LoadedTable, fetch_manifest_list_size, identity_columns};
 use crate::write::data_files::AddedFile;
+use crate::write::storage::TableStorageFactory;
 use crate::{CommitAction, Error, IcebergDatastore, Result, drain_injector};
 
 /// The table property naming where new data files go, and the one naming
@@ -410,9 +411,9 @@ pub(crate) struct PendingInsert {
 
 impl CommitAction for PendingInsert {
     /// Commit the files as one append snapshot, through a catalog client of
-    /// the commit's own, and publish the table at the landed version into the
-    /// datastore's index, so the next query sees the rows before the
-    /// background refresh does.
+    /// the commit's own whose file IO writes through the target's store, and
+    /// publish the table at the landed version into the datastore's index, so
+    /// the next query sees the rows before the background refresh does.
     fn apply(self: Box<Self>, datastore: &IcebergDatastore) -> Result<()> {
         let files: Vec<AddedFile> = drain_injector(&self.uploaded_files)
             .into_iter()
@@ -429,14 +430,20 @@ impl CommitAction for PendingInsert {
         if files.is_empty() {
             return Ok(());
         }
-        let catalog = datastore.config.build_client()?;
-        let committed =
-            commit::commit_append(&catalog, &datastore.dispatcher, &self.target, &files)?;
+        let storage_factory = Arc::new(TableStorageFactory::new(
+            self.target.clone(),
+            datastore.store_factory.clone(),
+        ));
+        let catalog = datastore.config.build_client(storage_factory)?;
+        let table = commit::commit_append(&catalog, &self.target, &files)?;
+        let manifest_list_size =
+            fetch_manifest_list_size(&self.target.name, &table, &self.target.store)?
+                .expect("an append leaves the table with a current snapshot");
         datastore.publish_table(
             &self.target.name,
-            committed.table,
+            table,
             self.target.store.clone(),
-            committed.manifest_list_size,
+            manifest_list_size,
         );
         Ok(())
     }

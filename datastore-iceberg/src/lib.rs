@@ -109,6 +109,7 @@ use async_trait::async_trait;
 use catalog::datastore::{Datastore, DatastoreTableMetadata, DatastoreTransaction};
 use crossbeam_deque::{Injector, Steal};
 use dispatch::DataFlowDispatcher;
+use iceberg::io::MemoryStorageFactory;
 use iceberg::table::Table;
 use iceberg::{Catalog, ErrorKind};
 use iceberg_catalog_rest::RestCatalog;
@@ -222,14 +223,6 @@ pub enum Error {
         "table `{table}` changed its partition spec while the insert ran; its files were written for the previous spec"
     )]
     PartitionSpecChanged { table: String },
-    #[error("committing to table `{table}` lost the race to another writer {attempts} times")]
-    CommitRacesExhausted { table: String, attempts: usize },
-    #[error("a commit write failed {attempts} times: {source}")]
-    CommitRetriesExhausted {
-        attempts: usize,
-        #[source]
-        source: object_storage::StoreError,
-    },
     #[error("data file `{file}` has no statistics to record")]
     MissingFileStats { file: String },
     #[error("data file `{file}` cannot be recorded: {message}")]
@@ -439,7 +432,8 @@ impl IcebergDatastore {
     /// the answer was in flight keeps the committed version, which is later
     /// than the answer's.
     pub fn refresh(&self) -> Result<()> {
-        let mut fetched = self.fetch_index(&self.config.build_client()?)?;
+        let catalog = self.config.build_client(Arc::new(MemoryStorageFactory))?;
+        let mut fetched = self.fetch_index(&catalog)?;
         let mut index = self.index.write().unwrap();
         for (schema, held_schema) in &index.schemas {
             let Some(fetched_schema) = fetched.schemas.get_mut(schema) else {

@@ -153,6 +153,11 @@ impl TableStore {
         &self.store
     }
 
+    /// The table whose files the store holds, as its errors name it.
+    pub(crate) fn table_name(&self) -> &str {
+        &self.table
+    }
+
     /// The key of `location` under the table's root, refusing a location
     /// under any other.
     pub(crate) fn key_of(&self, location: &str) -> Result<ObjectPath> {

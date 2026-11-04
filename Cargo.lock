@@ -1842,6 +1842,7 @@ dependencies = [
  "arrow-cast",
  "arrow-schema",
  "async-trait",
+ "bytes",
  "catalog",
  "crossbeam-deque",
  "dispatch",
@@ -1855,14 +1856,16 @@ dependencies = [
  "planner",
  "reqwest 0.12.28",
  "roaring",
+ "serde",
  "serde_json",
+ "tempfile",
  "testcontainers",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "typetag",
  "ureq",
  "url",
- "uuid",
 ]
 
 [[package]]

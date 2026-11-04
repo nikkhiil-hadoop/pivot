@@ -11,7 +11,7 @@ use std::future::Future;
 use std::sync::{Arc, LazyLock};
 
 use iceberg::CatalogBuilder;
-use iceberg::io::MemoryStorageFactory;
+use iceberg::io::StorageFactory;
 use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
 
 use crate::Result;
@@ -74,10 +74,16 @@ impl IcebergCatalogConfig {
     /// client exchanges an OAuth2 credential for a token on its first request
     /// and never renews it, so none is kept. Nothing is sent yet: the client
     /// fetches the catalog's own configuration on its first call, so an
-    /// unreachable catalog fails there, not here. The client's own storage layer
-    /// is never used (every file is read through Pivot's ring), so it is given
-    /// an in-memory storage factory that satisfies the requirement to have one.
-    pub(crate) fn build_client(&self) -> Result<RestCatalog> {
+    /// unreachable catalog fails there, not here. `storage_factory` builds
+    /// the file IO of every table the client loads: a client that only reads
+    /// the catalog never uses it (every file is read through Pivot's ring)
+    /// and is given an in-memory one; a client a commit goes through is given
+    /// one over the table's store, which the commit's manifests are written
+    /// through.
+    pub(crate) fn build_client(
+        &self,
+        storage_factory: Arc<dyn StorageFactory>,
+    ) -> Result<RestCatalog> {
         let mut properties = self.properties.clone();
         properties.insert("uri".to_string(), self.uri.clone());
         // Ask the catalog to vend storage credentials with each table it loads. A
@@ -112,7 +118,7 @@ impl IcebergCatalogConfig {
         // `load` captures the current runtime before returning its future.
         let catalog = block_on(async {
             RestCatalogBuilder::default()
-                .with_storage_factory(Arc::new(MemoryStorageFactory))
+                .with_storage_factory(storage_factory)
                 .load(CATALOG_NAME, properties)
                 .await
         })
