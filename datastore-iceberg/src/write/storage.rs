@@ -5,7 +5,10 @@
 //! the table the catalog loaded. The commit's catalog client builds that file
 //! IO with the factory here, so the objects land through the table's store,
 //! signed with the keys the catalog vended for the table, exactly as its data
-//! files did. The store's calls block, so each runs off the runtime's workers.
+//! files did: over the pool, through the ring every data file is uploaded
+//! with, and what the transaction reads (the current manifest list) is read
+//! over the pool too, through the same caches every query reads the table
+//! with. The store's calls block, so each runs off the runtime's workers.
 
 use std::fmt;
 use std::ops::Range;
@@ -13,6 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use dispatch::DataFlowDispatcher;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use iceberg::io::{
@@ -20,7 +24,9 @@ use iceberg::io::{
     StorageFactory,
 };
 use iceberg::{Error as IcebergError, ErrorKind};
-use object_storage::{ExternalStoreFactory, ObjectPath};
+use object_storage::{
+    ExternalStoreFactory, FileRef, ObjectPath, ObjectWrite, load_objects, store_objects,
+};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -34,16 +40,19 @@ use crate::write::WriteTarget;
 pub(crate) struct TableStorageFactory {
     target: Arc<WriteTarget>,
     store_factory: Arc<dyn ExternalStoreFactory>,
+    dispatcher: DataFlowDispatcher,
 }
 
 impl TableStorageFactory {
     pub(crate) fn new(
         target: Arc<WriteTarget>,
         store_factory: Arc<dyn ExternalStoreFactory>,
+        dispatcher: DataFlowDispatcher,
     ) -> Self {
         Self {
             target,
             store_factory,
+            dispatcher,
         }
     }
 }
@@ -65,7 +74,10 @@ impl StorageFactory for TableStorageFactory {
             vended,
         )
         .map_err(into_iceberg_error)?;
-        Ok(Arc::new(TableStorage { store }))
+        Ok(Arc::new(TableStorage {
+            store,
+            dispatcher: self.dispatcher.clone(),
+        }))
     }
 }
 
@@ -78,21 +90,26 @@ impl fmt::Debug for TableStorageFactory {
 }
 
 /// The crate's storage over one table's store: a file is located by its full
-/// location, which must be under the table's root, and read or written whole.
+/// location, which must be under the table's root, and read or written whole
+/// over the pool, through the ring every read and upload of the table goes
+/// through.
 #[derive(Clone)]
 pub(crate) struct TableStorage {
     store: TableStore,
+    dispatcher: DataFlowDispatcher,
 }
 
 impl TableStorage {
     /// Run `call` against the store on a blocking thread: the store's calls
-    /// block on the network, and the runtime's workers must not.
+    /// block on the network, a pool read blocks until the workers finish, and
+    /// the runtime's workers must not.
     async fn blocking<T: Send + 'static>(
         &self,
-        call: impl FnOnce(&TableStore) -> crate::Result<T> + Send + 'static,
+        call: impl FnOnce(&TableStore, &DataFlowDispatcher) -> crate::Result<T> + Send + 'static,
     ) -> iceberg::Result<T> {
         let store = self.store.clone();
-        tokio::task::spawn_blocking(move || call(&store))
+        let dispatcher = self.dispatcher.clone();
+        tokio::task::spawn_blocking(move || call(&store, &dispatcher))
             .await
             .map_err(|panicked| {
                 IcebergError::new(ErrorKind::Unexpected, "a store call panicked")
@@ -104,8 +121,44 @@ impl TableStorage {
     /// The size of the object at `path`, or `None` when there is none.
     async fn size_of(&self, path: &str) -> iceberg::Result<Option<u64>> {
         let path = path.to_string();
-        self.blocking(move |store| store.object_size(&path)).await
+        self.blocking(move |store, _| store.object_size(&path))
+            .await
     }
+}
+
+/// The object at `location`, read in full over the pool: the pool reads a
+/// known extent, so the object is sized first. `None` when there is none.
+fn read_over_pool(
+    store: &TableStore,
+    dispatcher: &DataFlowDispatcher,
+    location: &str,
+) -> crate::Result<Option<Vec<u8>>> {
+    let Some(size) = store.object_size(location)? else {
+        return Ok(None);
+    };
+    let read = load_objects(dispatcher, &[store.data_file(location, size)?])?
+        .pop()
+        .expect("the pool reads one object per file");
+    Ok(Some(read.bytes))
+}
+
+/// `bytes` written as the object at `location`, over the pool.
+fn write_over_pool(
+    store: &TableStore,
+    dispatcher: &DataFlowDispatcher,
+    location: &str,
+    bytes: Bytes,
+) -> crate::Result<()> {
+    let key = store.key_of(location)?;
+    let write = ObjectWrite {
+        file: FileRef {
+            path: ObjectPath::new(location),
+            size: bytes.len() as u64,
+        },
+        sink: store.store().sink(&key)?,
+        bytes: bytes.to_vec(),
+    };
+    Ok(store_objects(dispatcher, vec![write])?)
 }
 
 #[async_trait]
@@ -123,7 +176,7 @@ impl Storage for TableStorage {
     async fn read(&self, path: &str) -> iceberg::Result<Bytes> {
         let location = path.to_string();
         let bytes = self
-            .blocking(move |store| Ok(store.store().get(&store.key_of(&location)?)?))
+            .blocking(move |store, dispatcher| read_over_pool(store, dispatcher, &location))
             .await?
             .ok_or_else(|| not_found(path))?;
         Ok(Bytes::from(bytes))
@@ -137,12 +190,12 @@ impl Storage for TableStorage {
 
     async fn write(&self, path: &str, bytes: Bytes) -> iceberg::Result<()> {
         let location = path.to_string();
-        self.blocking(move |store| Ok(store.store().put(&store.key_of(&location)?, &bytes)?))
+        self.blocking(move |store, dispatcher| write_over_pool(store, dispatcher, &location, bytes))
             .await
     }
 
     async fn writer(&self, path: &str) -> iceberg::Result<Box<dyn FileWrite>> {
-        Ok(Box::new(ObjectWrite {
+        Ok(Box::new(BufferedWrite {
             storage: self.clone(),
             path: path.to_string(),
             buffer: Vec::new(),
@@ -151,13 +204,13 @@ impl Storage for TableStorage {
 
     async fn delete(&self, path: &str) -> iceberg::Result<()> {
         let location = path.to_string();
-        self.blocking(move |store| Ok(store.store().delete(&store.key_of(&location)?)?))
+        self.blocking(move |store, _| Ok(store.store().delete(&store.key_of(&location)?)?))
             .await
     }
 
     async fn delete_prefix(&self, path: &str) -> iceberg::Result<()> {
         let location = path.to_string();
-        self.blocking(move |store| delete_under(store, &store.key_of(&location)?))
+        self.blocking(move |store, _| delete_under(store, &store.key_of(&location)?))
             .await
     }
 
@@ -228,16 +281,15 @@ impl FileRead for ObjectRead {
     }
 }
 
-/// A file written whole when closed: an object store takes an object in one
-/// put.
-struct ObjectWrite {
+/// A file written whole when closed: the pool takes an object in one write.
+struct BufferedWrite {
     storage: TableStorage,
     path: String,
     buffer: Vec<u8>,
 }
 
 #[async_trait]
-impl FileWrite for ObjectWrite {
+impl FileWrite for BufferedWrite {
     async fn write(&mut self, bytes: Bytes) -> iceberg::Result<()> {
         self.buffer.extend_from_slice(&bytes);
         Ok(())
@@ -294,9 +346,15 @@ impl<'de> Deserialize<'de> for TableStorage {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
+    use dispatch::Dispatch;
     use object_storage::{LocalStore, ObjectStore, StoreError};
 
     use super::*;
+
+    /// One pool for every test here: a pool is a process-wide ring.
+    static DISPATCH: LazyLock<Dispatch> = LazyLock::new(|| Dispatch::spin_up(2, 64, None));
 
     /// Opens the local filesystem for a `file:///` root.
     #[derive(Debug)]
@@ -313,10 +371,15 @@ mod tests {
         }
     }
 
+    /// A storage over a table whose metadata directory is under `directory`.
     fn storage_over(directory: &std::path::Path) -> TableStorage {
+        std::fs::create_dir(directory.join("metadata")).unwrap();
         let metadata_location = format!("file://{}/metadata/v1.metadata.json", directory.display());
         let store = TableStore::open("db.t", &metadata_location, &LocalFactory, None).unwrap();
-        TableStorage { store }
+        TableStorage {
+            store,
+            dispatcher: DISPATCH.dispatcher().clone(),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

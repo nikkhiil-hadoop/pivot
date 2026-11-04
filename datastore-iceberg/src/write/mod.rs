@@ -433,6 +433,7 @@ impl CommitAction for PendingInsert {
         let storage_factory = Arc::new(TableStorageFactory::new(
             self.target.clone(),
             datastore.store_factory.clone(),
+            datastore.dispatcher.clone(),
         ));
         let catalog = datastore.config.build_client(storage_factory)?;
         let table = commit::commit_append(&catalog, &self.target, &files)?;
