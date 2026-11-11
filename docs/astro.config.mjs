@@ -43,6 +43,7 @@ export default defineConfig({
         },
       },
       components: {
+        Head: "./src/components/Head.astro",
         // Opens light for a first-time reader instead of following the OS.
         ThemeProvider: "./src/components/ThemeProvider.astro",
         // Draws the wordmark with its cursor as a separate element.

@@ -69,9 +69,23 @@ import Select from "@astrojs/starlight/components/Select.astro";
       theme === "auto" ? getPreferredColorScheme() : theme;
   }
 
-  function onThemeChange(theme: Theme): void {
+  function onThemeChange(theme: Theme, wasReaderSelected = false): void {
     applyTheme(theme);
     storeTheme(theme);
+    if (wasReaderSelected) {
+      const posthog = (
+        window as Window & {
+          posthog?: {
+            capture: (event: string, properties: { theme: Theme }) => void;
+            logger?: {
+              info: (message: string, attributes: { theme: Theme }) => void;
+            };
+          };
+        }
+      ).posthog;
+      posthog?.capture("theme_preference_changed", { theme });
+      posthog?.logger?.info("documentation theme preference selected", { theme });
+    }
   }
 
   matchMedia(`(prefers-color-scheme: light)`).addEventListener("change", () => {
@@ -86,7 +100,7 @@ import Select from "@astrojs/starlight/components/Select.astro";
       applyTheme(loadTheme());
       this.querySelector("select")?.addEventListener("change", (e) => {
         if (e.currentTarget instanceof HTMLSelectElement) {
-          onThemeChange(parseTheme(e.currentTarget.value));
+          onThemeChange(parseTheme(e.currentTarget.value), true);
         }
       });
     }
