@@ -1,0 +1,8 @@
+---
+import PostHog from "./posthog.astro";
+
+const { head } = Astro.locals.starlightRoute;
+---
+
+{head.map(({ tag: Tag, attrs, content }) => <Tag {...attrs} set:html={content} />)}
+<PostHog />
